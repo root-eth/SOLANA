@@ -1,3 +1,5 @@
+//! The Solana [`Account`] type.
+
 use {
     crate::{
         clock::{Epoch, INITIAL_RENT_EPOCH},
@@ -486,7 +488,7 @@ fn shared_serialize_data<T: serde::Serialize, U: WritableAccount>(
     if bincode::serialized_size(state)? > account.data().len() as u64 {
         return Err(Box::new(bincode::ErrorKind::SizeLimit));
     }
-    bincode::serialize_into(&mut account.data_as_mut_slice(), state)
+    bincode::serialize_into(account.data_as_mut_slice(), state)
 }
 
 impl Account {

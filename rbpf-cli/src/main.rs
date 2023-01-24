@@ -3,16 +3,15 @@ use {
     serde::{Deserialize, Serialize},
     serde_json::Result,
     solana_bpf_loader_program::{
-        create_vm, serialization::serialize_parameters, syscalls::register_syscalls,
-        ThisInstructionMeter,
+        create_vm, serialization::serialize_parameters, syscalls::create_loader,
     },
-    solana_program_runtime::invoke_context::{prepare_mock_invoke_context, InvokeContext},
+    solana_program_runtime::{
+        compute_budget::ComputeBudget,
+        invoke_context::{prepare_mock_invoke_context, InvokeContext},
+    },
     solana_rbpf::{
-        assembler::assemble,
-        elf::Executable,
-        static_analysis::Analysis,
-        verifier::RequisiteVerifier,
-        vm::{Config, DynamicAnalysis, VerifiedExecutable},
+        assembler::assemble, elf::Executable, static_analysis::Analysis,
+        verifier::RequisiteVerifier, vm::VerifiedExecutable,
     },
     solana_sdk::{
         account::AccountSharedData, bpf_loader, instruction::AccountMeta, pubkey::Pubkey,
@@ -21,7 +20,7 @@ use {
     std::{
         fmt::{Debug, Formatter},
         fs::File,
-        io::{Read, Seek, SeekFrom},
+        io::{Read, Seek},
         path::Path,
         time::{Duration, Instant},
     },
@@ -121,14 +120,15 @@ with input data, or BYTES is the number of 0-valued bytes to allocate for progra
                 .help(
                     "Method of execution to use, where 'cfg' generates Control Flow Graph \
 of the program, 'disassembler' dumps disassembled code of the program, 'interpreter' runs \
-the program in the virtual machine's interpreter, and 'jit' precompiles the program to \
-native machine code before execting it in the virtual machine.",
+the program in the virtual machine's interpreter, 'debugger' is the same as 'interpreter' \
+but hosts a GDB interface, and 'jit' precompiles the program to native machine code \
+before execting it in the virtual machine.",
                 )
                 .short('u')
                 .long("use")
                 .takes_value(true)
                 .value_name("VALUE")
-                .possible_values(["cfg", "disassembler", "interpreter", "jit"])
+                .possible_values(["cfg", "disassembler", "interpreter", "debugger", "jit"])
                 .default_value("jit"),
         )
         .arg(
@@ -141,16 +141,12 @@ native machine code before execting it in the virtual machine.",
                 .default_value(&std::i64::MAX.to_string()),
         )
         .arg(
-            Arg::new("trace")
-                .help("Output trace to 'trace.out' file using tracing instrumentation")
-                .short('t')
-                .long("trace"),
-        )
-        .arg(
-            Arg::new("profile")
-                .help("Output profile to 'profile.dot' file using tracing instrumentation")
-                .short('p')
-                .long("profile"),
+            Arg::new("port")
+                .help("Port to use for the connection with a remote debugger")
+                .long("port")
+                .takes_value(true)
+                .value_name("PORT")
+                .default_value("9001"),
         )
         .arg(
             Arg::new("output_format")
@@ -161,13 +157,16 @@ native machine code before execting it in the virtual machine.",
                 .takes_value(true)
                 .possible_values(["json", "json-compact"]),
         )
+        .arg(
+            Arg::new("trace")
+                .help("Output instruction trace")
+                .short('t')
+                .long("trace")
+                .takes_value(true)
+                .value_name("FILE"),
+        )
         .get_matches();
 
-    let config = Config {
-        enable_instruction_tracing: matches.is_present("trace") || matches.is_present("profile"),
-        enable_symbol_and_section_labels: true,
-        ..Config::default()
-    };
     let loader_id = bpf_loader::id();
     let mut transaction_accounts = vec![
         (
@@ -242,34 +241,37 @@ native machine code before execting it in the virtual machine.",
         true, // should_cap_ix_accounts
     )
     .unwrap();
-    let compute_meter = invoke_context.get_compute_meter();
-    let mut instruction_meter = ThisInstructionMeter { compute_meter };
 
     let program = matches.value_of("PROGRAM").unwrap();
     let mut file = File::open(Path::new(program)).unwrap();
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).unwrap();
-    file.seek(SeekFrom::Start(0)).unwrap();
+    file.rewind().unwrap();
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).unwrap();
-    let syscall_registry = register_syscalls(&invoke_context.feature_set, true).unwrap();
+    let loader = create_loader(
+        &invoke_context.feature_set,
+        &ComputeBudget::default(),
+        true,
+        true,
+        true,
+    )
+    .unwrap();
     let executable = if magic == [0x7f, 0x45, 0x4c, 0x46] {
-        Executable::<ThisInstructionMeter>::from_elf(&contents, config, syscall_registry)
-            .map_err(|err| format!("Executable constructor failed: {:?}", err))
+        Executable::<InvokeContext>::from_elf(&contents, loader)
+            .map_err(|err| format!("Executable constructor failed: {err:?}"))
     } else {
-        assemble::<ThisInstructionMeter>(
-            std::str::from_utf8(contents.as_slice()).unwrap(),
-            config,
-            syscall_registry,
-        )
+        assemble::<InvokeContext>(std::str::from_utf8(contents.as_slice()).unwrap(), loader)
     }
     .unwrap();
 
+    #[allow(unused_mut)]
     let mut verified_executable =
-        VerifiedExecutable::<RequisiteVerifier, ThisInstructionMeter>::from_executable(executable)
-            .map_err(|err| format!("Executable verifier failed: {:?}", err))
+        VerifiedExecutable::<RequisiteVerifier, InvokeContext>::from_executable(executable)
+            .map_err(|err| format!("Executable verifier failed: {err:?}"))
             .unwrap();
 
+    #[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
     verified_executable.jit_compile().unwrap();
     let mut analysis = LazyAnalysis::new(verified_executable.get_executable());
 
@@ -298,37 +300,32 @@ native machine code before execting it in the virtual machine.",
     )
     .unwrap();
     let start_time = Instant::now();
-    let result = if matches.value_of("use").unwrap() == "interpreter" {
-        vm.execute_program_interpreted(&mut instruction_meter)
-    } else {
-        vm.execute_program_jit(&mut instruction_meter)
-    };
+    if matches.value_of("use").unwrap() == "debugger" {
+        vm.debug_port = Some(matches.value_of("port").unwrap().parse::<u16>().unwrap());
+    }
+    let (instruction_count, result) = vm.execute_program(matches.value_of("use").unwrap() != "jit");
     let duration = Instant::now() - start_time;
-
-    if matches.is_present("trace") {
-        eprintln!("Trace is saved in trace.out");
-        let mut file = File::create("trace.out").unwrap();
-        vm.get_program_environment()
-            .tracer
-            .write(&mut file, analysis.analyze())
-            .unwrap();
+    if matches.occurrences_of("trace") > 0 {
+        let trace_log = vm.env.context_object_pointer.trace_log.as_slice();
+        if matches.value_of("trace").unwrap() == "stdout" {
+            analysis
+                .analyze()
+                .disassemble_trace_log(&mut std::io::stdout(), trace_log)
+                .unwrap();
+        } else {
+            analysis
+                .analyze()
+                .disassemble_trace_log(
+                    &mut File::create(matches.value_of("trace").unwrap()).unwrap(),
+                    trace_log,
+                )
+                .unwrap();
+        }
     }
-    if matches.is_present("profile") {
-        eprintln!("Profile is saved in profile.dot");
-        let tracer = &vm.get_program_environment().tracer;
-        let analysis = analysis.analyze();
-        let dynamic_analysis = DynamicAnalysis::new(tracer, analysis);
-        let mut file = File::create("profile.dot").unwrap();
-        analysis
-            .visualize_graphically(&mut file, Some(&dynamic_analysis))
-            .unwrap();
-    }
-
-    let instruction_count = vm.get_total_instruction_count();
     drop(vm);
 
     let output = Output {
-        result: format!("{:?}", result),
+        result: format!("{result:?}"),
         instruction_count,
         execution_time: duration,
         log: invoke_context
@@ -347,7 +344,7 @@ native machine code before execting it in the virtual machine.",
         }
         _ => {
             println!("Program output:");
-            println!("{:?}", output);
+            println!("{output:?}");
         }
     }
 }
@@ -366,7 +363,7 @@ impl Debug for Output {
         writeln!(f, "Instruction Count: {}", self.instruction_count)?;
         writeln!(f, "Execution time: {} us", self.execution_time.as_micros())?;
         for line in &self.log {
-            writeln!(f, "{}", line)?;
+            writeln!(f, "{line}")?;
         }
         Ok(())
     }
@@ -374,20 +371,20 @@ impl Debug for Output {
 
 // Replace with std::lazy::Lazy when stabilized.
 // https://github.com/rust-lang/rust/issues/74465
-struct LazyAnalysis<'a> {
-    analysis: Option<Analysis<'a, ThisInstructionMeter>>,
-    executable: &'a Executable<ThisInstructionMeter>,
+struct LazyAnalysis<'a, 'b> {
+    analysis: Option<Analysis<'a>>,
+    executable: &'a Executable<InvokeContext<'b>>,
 }
 
-impl<'a> LazyAnalysis<'a> {
-    fn new(executable: &'a Executable<ThisInstructionMeter>) -> Self {
+impl<'a, 'b> LazyAnalysis<'a, 'b> {
+    fn new(executable: &'a Executable<InvokeContext<'b>>) -> Self {
         Self {
             analysis: None,
             executable,
         }
     }
 
-    fn analyze(&mut self) -> &Analysis<ThisInstructionMeter> {
+    fn analyze(&mut self) -> &Analysis {
         if let Some(ref analysis) = self.analysis {
             return analysis;
         }

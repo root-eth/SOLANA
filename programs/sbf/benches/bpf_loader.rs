@@ -8,17 +8,19 @@ extern crate solana_bpf_loader_program;
 use {
     byteorder::{ByteOrder, LittleEndian, WriteBytesExt},
     solana_bpf_loader_program::{
-        create_vm, serialization::serialize_parameters, syscalls::register_syscalls,
-        ThisInstructionMeter,
+        create_vm, serialization::serialize_parameters, syscalls::create_loader,
     },
     solana_measure::measure::Measure,
-    solana_program_runtime::invoke_context::with_mock_invoke_context,
+    solana_program_runtime::{
+        compute_budget::ComputeBudget,
+        invoke_context::{with_mock_invoke_context, InvokeContext},
+    },
     solana_rbpf::{
         ebpf::MM_INPUT_START,
         elf::Executable,
         memory_region::MemoryRegion,
         verifier::RequisiteVerifier,
-        vm::{Config, InstructionMeter, SyscallRegistry, VerifiedExecutable},
+        vm::{ContextObject, VerifiedExecutable},
     },
     solana_runtime::{
         bank::Bank,
@@ -30,6 +32,7 @@ use {
         bpf_loader,
         client::SyncClient,
         entrypoint::SUCCESS,
+        feature_set::FeatureSet,
         instruction::{AccountMeta, Instruction},
         message::Message,
         pubkey::Pubkey,
@@ -81,13 +84,16 @@ const ARMSTRONG_EXPECTED: u64 = 5;
 fn bench_program_create_executable(bencher: &mut Bencher) {
     let elf = load_elf("bench_alu").unwrap();
 
+    let loader = create_loader(
+        &FeatureSet::default(),
+        &ComputeBudget::default(),
+        true,
+        true,
+        false,
+    )
+    .unwrap();
     bencher.iter(|| {
-        let _ = Executable::<ThisInstructionMeter>::from_elf(
-            &elf,
-            Config::default(),
-            SyscallRegistry::default(),
-        )
-        .unwrap();
+        let _ = Executable::<InvokeContext>::from_elf(&elf, loader.clone()).unwrap();
     });
 }
 
@@ -103,26 +109,21 @@ fn bench_program_alu(bencher: &mut Bencher) {
     let elf = load_elf("bench_alu").unwrap();
     let loader_id = bpf_loader::id();
     with_mock_invoke_context(loader_id, 10000001, false, |invoke_context| {
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(std::i64::MAX as u64);
-        let executable = Executable::<ThisInstructionMeter>::from_elf(
-            &elf,
-            Config::default(),
-            register_syscalls(&invoke_context.feature_set, true).unwrap(),
+        let loader = create_loader(
+            &invoke_context.feature_set,
+            &ComputeBudget::default(),
+            true,
+            true,
+            false,
         )
         .unwrap();
+        let executable = Executable::<InvokeContext>::from_elf(&elf, loader).unwrap();
 
         let mut verified_executable =
-            VerifiedExecutable::<RequisiteVerifier, ThisInstructionMeter>::from_executable(
-                executable,
-            )
-            .unwrap();
+            VerifiedExecutable::<RequisiteVerifier, InvokeContext>::from_executable(executable)
+                .unwrap();
 
         verified_executable.jit_compile().unwrap();
-        let compute_meter = invoke_context.get_compute_meter();
-        let mut instruction_meter = ThisInstructionMeter { compute_meter };
         let mut vm = create_vm(
             &verified_executable,
             vec![MemoryRegion::new_writable(&mut inner_iter, MM_INPUT_START)],
@@ -132,11 +133,11 @@ fn bench_program_alu(bencher: &mut Bencher) {
         .unwrap();
 
         println!("Interpreted:");
-        assert_eq!(
-            SUCCESS,
-            vm.execute_program_interpreted(&mut instruction_meter)
-                .unwrap()
-        );
+        vm.env
+            .context_object_pointer
+            .mock_set_remaining(std::i64::MAX as u64);
+        let (instructions, result) = vm.execute_program(true);
+        assert_eq!(SUCCESS, result.unwrap());
         assert_eq!(ARMSTRONG_LIMIT, LittleEndian::read_u64(&inner_iter));
         assert_eq!(
             ARMSTRONG_EXPECTED,
@@ -144,11 +145,12 @@ fn bench_program_alu(bencher: &mut Bencher) {
         );
 
         bencher.iter(|| {
-            vm.execute_program_interpreted(&mut instruction_meter)
-                .unwrap();
+            vm.env
+                .context_object_pointer
+                .mock_set_remaining(std::i64::MAX as u64);
+            vm.execute_program(true).1.unwrap();
         });
-        let instructions = vm.get_total_instruction_count();
-        let summary = bencher.bench(|_bencher| {}).unwrap();
+        let summary = bencher.bench(|_bencher| Ok(())).unwrap().unwrap();
         println!("  {:?} instructions", instructions);
         println!("  {:?} ns/iter median", summary.median as u64);
         assert!(0f64 != summary.median);
@@ -157,18 +159,20 @@ fn bench_program_alu(bencher: &mut Bencher) {
         println!("{{ \"type\": \"bench\", \"name\": \"bench_program_alu_interpreted_mips\", \"median\": {:?}, \"deviation\": 0 }}", mips);
 
         println!("JIT to native:");
-        assert_eq!(
-            SUCCESS,
-            vm.execute_program_jit(&mut instruction_meter).unwrap()
-        );
+        assert_eq!(SUCCESS, vm.execute_program(false).1.unwrap());
         assert_eq!(ARMSTRONG_LIMIT, LittleEndian::read_u64(&inner_iter));
         assert_eq!(
             ARMSTRONG_EXPECTED,
             LittleEndian::read_u64(&inner_iter[mem::size_of::<u64>()..])
         );
 
-        bencher.iter(|| vm.execute_program_jit(&mut instruction_meter).unwrap());
-        let summary = bencher.bench(|_bencher| {}).unwrap();
+        bencher.iter(|| {
+            vm.env
+                .context_object_pointer
+                .mock_set_remaining(std::i64::MAX as u64);
+            vm.execute_program(false).1.unwrap();
+        });
+        let summary = bencher.bench(|_bencher| Ok(())).unwrap().unwrap();
         println!("  {:?} instructions", instructions);
         println!("  {:?} ns/iter median", summary.median as u64);
         assert!(0f64 != summary.median);
@@ -219,10 +223,7 @@ fn bench_create_vm(bencher: &mut Bencher) {
     let loader_id = bpf_loader::id();
     with_mock_invoke_context(loader_id, 10000001, false, |invoke_context| {
         const BUDGET: u64 = 200_000;
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(BUDGET);
+        invoke_context.mock_set_remaining(BUDGET);
 
         // Serialize account data
         let (_serialized, regions, account_lengths) = serialize_parameters(
@@ -235,18 +236,19 @@ fn bench_create_vm(bencher: &mut Bencher) {
         )
         .unwrap();
 
-        let executable = Executable::<ThisInstructionMeter>::from_elf(
-            &elf,
-            Config::default(),
-            register_syscalls(&invoke_context.feature_set, true).unwrap(),
+        let loader = create_loader(
+            &invoke_context.feature_set,
+            &ComputeBudget::default(),
+            true,
+            true,
+            false,
         )
         .unwrap();
+        let executable = Executable::<InvokeContext>::from_elf(&elf, loader).unwrap();
 
         let verified_executable =
-            VerifiedExecutable::<RequisiteVerifier, ThisInstructionMeter>::from_executable(
-                executable,
-            )
-            .unwrap();
+            VerifiedExecutable::<RequisiteVerifier, InvokeContext>::from_executable(executable)
+                .unwrap();
 
         bencher.iter(|| {
             let _ = create_vm(
@@ -266,10 +268,7 @@ fn bench_instruction_count_tuner(_bencher: &mut Bencher) {
     let loader_id = bpf_loader::id();
     with_mock_invoke_context(loader_id, 10000001, true, |invoke_context| {
         const BUDGET: u64 = 200_000;
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(BUDGET);
+        invoke_context.mock_set_remaining(BUDGET);
 
         // Serialize account data
         let (_serialized, regions, account_lengths) = serialize_parameters(
@@ -282,21 +281,20 @@ fn bench_instruction_count_tuner(_bencher: &mut Bencher) {
         )
         .unwrap();
 
-        let executable = Executable::<ThisInstructionMeter>::from_elf(
-            &elf,
-            Config::default(),
-            register_syscalls(&invoke_context.feature_set, true).unwrap(),
+        let loader = create_loader(
+            &invoke_context.feature_set,
+            &ComputeBudget::default(),
+            true,
+            true,
+            false,
         )
         .unwrap();
+        let executable = Executable::<InvokeContext>::from_elf(&elf, loader).unwrap();
 
         let verified_executable =
-            VerifiedExecutable::<RequisiteVerifier, ThisInstructionMeter>::from_executable(
-                executable,
-            )
-            .unwrap();
+            VerifiedExecutable::<RequisiteVerifier, InvokeContext>::from_executable(executable)
+                .unwrap();
 
-        let compute_meter = invoke_context.get_compute_meter();
-        let mut instruction_meter = ThisInstructionMeter { compute_meter };
         let mut vm = create_vm(
             &verified_executable,
             regions,
@@ -306,19 +304,19 @@ fn bench_instruction_count_tuner(_bencher: &mut Bencher) {
         .unwrap();
 
         let mut measure = Measure::start("tune");
-        let _ = vm.execute_program_interpreted(&mut instruction_meter);
+        let (instructions, _result) = vm.execute_program(true);
         measure.stop();
 
         assert_eq!(
             0,
-            instruction_meter.get_remaining(),
+            vm.env.context_object_pointer.get_remaining(),
             "Tuner must consume the whole budget"
         );
         println!(
             "{:?} compute units took {:?} us ({:?} instructions)",
-            BUDGET - instruction_meter.get_remaining(),
+            BUDGET - vm.env.context_object_pointer.get_remaining(),
             measure.as_us(),
-            vm.get_total_instruction_count(),
+            instructions,
         );
     });
 }

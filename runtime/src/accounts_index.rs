@@ -754,7 +754,6 @@ impl<T: IndexValue> AccountsIndex<T> {
         let bin_calculator = PubkeyBinCalculator24::new(bins);
         let storage = AccountsIndexStorage::new(bins, &config, exit);
         let account_maps = (0..bins)
-            .into_iter()
             .map(|bin| Arc::clone(&storage.in_mem[bin]))
             .collect::<Vec<_>>();
         (account_maps, bin_calculator, storage)
@@ -1472,6 +1471,22 @@ impl<T: IndexValue> AccountsIndex<T> {
         }
     }
 
+    pub fn get_index_key_size(&self, index: &AccountIndex, index_key: &Pubkey) -> Option<usize> {
+        match index {
+            AccountIndex::ProgramId => self.program_id_index.index.get(index_key).map(|x| x.len()),
+            AccountIndex::SplTokenOwner => self
+                .spl_token_owner_index
+                .index
+                .get(index_key)
+                .map(|x| x.len()),
+            AccountIndex::SplTokenMint => self
+                .spl_token_mint_index
+                .index
+                .get(index_key)
+                .map(|x| x.len()),
+        }
+    }
+
     /// log any secondary index counts, if non-zero
     pub(crate) fn log_secondary_indexes(&self) {
         if !self.program_id_index.index.is_empty() {
@@ -1566,7 +1581,6 @@ impl<T: IndexValue> AccountsIndex<T> {
         let random_offset = thread_rng().gen_range(0, bins);
         let use_disk = self.storage.storage.disk.is_some();
         let mut binned = (0..bins)
-            .into_iter()
             .map(|mut pubkey_bin| {
                 // opposite of (pubkey_bin + random_offset) % bins
                 pubkey_bin = if pubkey_bin < random_offset {
@@ -1621,7 +1635,6 @@ impl<T: IndexValue> AccountsIndex<T> {
     /// return Vec<Vec<>> because the internal vecs are already allocated per bin
     pub fn retrieve_duplicate_keys_from_startup(&self) -> Vec<Vec<(Slot, Pubkey)>> {
         (0..self.bins())
-            .into_iter()
             .map(|pubkey_bin| {
                 let r_account_maps = &self.account_maps[pubkey_bin];
                 r_account_maps.retrieve_duplicate_keys_from_startup()
@@ -1678,8 +1691,8 @@ impl<T: IndexValue> AccountsIndex<T> {
         })
     }
 
-    fn purge_secondary_indexes_by_inner_key<'a>(
-        &'a self,
+    fn purge_secondary_indexes_by_inner_key(
+        &self,
         inner_key: &Pubkey,
         account_indexes: &AccountSecondaryIndexes,
     ) {
@@ -1801,7 +1814,7 @@ impl<T: IndexValue> AccountsIndex<T> {
             .contains(&slot)
     }
 
-    pub fn add_root(&self, slot: Slot, caching_enabled: bool) {
+    pub fn add_root(&self, slot: Slot) {
         self.roots_added.fetch_add(1, Ordering::Relaxed);
         let mut w_roots_tracker = self.roots_tracker.write().unwrap();
         // `AccountsDb::flush_accounts_cache()` relies on roots being added in order
@@ -1809,10 +1822,6 @@ impl<T: IndexValue> AccountsIndex<T> {
         // 'slot' is a root, so it is both 'root' and 'original'
         w_roots_tracker.alive_roots.insert(slot);
         w_roots_tracker.historical_roots.insert(slot);
-        // we delay cleaning until flushing!
-        if !caching_enabled {
-            w_roots_tracker.uncleaned_roots.insert(slot);
-        }
     }
 
     pub fn add_uncleaned_roots<I>(&self, roots: I)
@@ -2122,14 +2131,14 @@ pub mod tests {
             assert_eq!(index.get_next_original_root(slot, ancestors), None);
         }
         // roots are now [1]. 0 and 1 both return 1
-        index.add_root(1, true);
+        index.add_root(1);
         for slot in 0..2 {
             assert_eq!(index.get_next_original_root(slot, ancestors), Some(1));
         }
         assert_eq!(index.get_next_original_root(2, ancestors), None); // no roots after 1, so asking for root >= 2 is None
 
         // roots are now [1, 3]. 0 and 1 both return 1. 2 and 3 both return 3
-        index.add_root(3, true);
+        index.add_root(3);
         for slot in 0..2 {
             assert_eq!(index.get_next_original_root(slot, ancestors), Some(1));
         }
@@ -2176,7 +2185,7 @@ pub mod tests {
             assert_eq!(index.get_next_original_root(slot, ancestors), None);
         }
         // roots are now [1]. 0 and 1 both return 1
-        index.add_root(1, true);
+        index.add_root(1);
         for slot in 0..2 {
             assert_eq!(index.get_next_original_root(slot, ancestors), Some(1));
         }
@@ -2197,8 +2206,8 @@ pub mod tests {
     #[test]
     fn test_remove_old_historical_roots() {
         let index = AccountsIndex::<bool>::default_for_tests();
-        index.add_root(1, true);
-        index.add_root(2, true);
+        index.add_root(1);
+        index.add_root(2);
         assert_eq!(
             index
                 .roots_tracker
@@ -2238,8 +2247,8 @@ pub mod tests {
 
         // now use 'keep'
         let index = AccountsIndex::<bool>::default_for_tests();
-        index.add_root(1, true);
-        index.add_root(2, true);
+        index.add_root(1);
+        index.add_root(2);
         let hash_set_1 = vec![1].into_iter().collect();
         assert_eq!(
             index
@@ -2926,7 +2935,7 @@ pub mod tests {
             );
         }
 
-        index.add_root(root_slot, false);
+        index.add_root(root_slot);
 
         (index, pubkeys)
     }
@@ -3002,27 +3011,27 @@ pub mod tests {
 
         run_test_range_indexes(&index, &pubkeys, Some(ITER_BATCH_SIZE), None);
 
-        run_test_range_indexes(&index, &pubkeys, None, Some(2 * ITER_BATCH_SIZE as usize));
+        run_test_range_indexes(&index, &pubkeys, None, Some(2 * ITER_BATCH_SIZE));
 
         run_test_range_indexes(
             &index,
             &pubkeys,
-            Some(ITER_BATCH_SIZE as usize),
-            Some(2 * ITER_BATCH_SIZE as usize),
+            Some(ITER_BATCH_SIZE),
+            Some(2 * ITER_BATCH_SIZE),
         );
 
         run_test_range_indexes(
             &index,
             &pubkeys,
-            Some(ITER_BATCH_SIZE as usize),
-            Some(2 * ITER_BATCH_SIZE as usize - 1),
+            Some(ITER_BATCH_SIZE),
+            Some(2 * ITER_BATCH_SIZE - 1),
         );
 
         run_test_range_indexes(
             &index,
             &pubkeys,
             Some(ITER_BATCH_SIZE - 1_usize),
-            Some(2 * ITER_BATCH_SIZE as usize + 1),
+            Some(2 * ITER_BATCH_SIZE + 1),
         );
     }
 
@@ -3074,7 +3083,7 @@ pub mod tests {
     fn test_is_alive_root() {
         let index = AccountsIndex::<bool>::default_for_tests();
         assert!(!index.is_alive_root(0));
-        index.add_root(0, false);
+        index.add_root(0);
         assert!(index.is_alive_root(0));
     }
 
@@ -3095,7 +3104,7 @@ pub mod tests {
         );
         assert!(gc.is_empty());
 
-        index.add_root(0, false);
+        index.add_root(0);
         let (list, idx) = index.get_for_tests(&key, None, None).unwrap();
         assert_eq!(list.slot_list()[idx], (0, true));
     }
@@ -3103,8 +3112,8 @@ pub mod tests {
     #[test]
     fn test_clean_first() {
         let index = AccountsIndex::<bool>::default_for_tests();
-        index.add_root(0, false);
-        index.add_root(1, false);
+        index.add_root(0);
+        index.add_root(1);
         index.clean_dead_slot(0, &mut AccountsIndexRootsStats::default());
         assert!(index.is_alive_root(1));
         assert!(!index.is_alive_root(0));
@@ -3114,8 +3123,8 @@ pub mod tests {
     fn test_clean_last() {
         //this behavior might be undefined, clean up should only occur on older slots
         let index = AccountsIndex::<bool>::default_for_tests();
-        index.add_root(0, false);
-        index.add_root(1, false);
+        index.add_root(0);
+        index.add_root(1);
         index.clean_dead_slot(1, &mut AccountsIndexRootsStats::default());
         assert!(!index.is_alive_root(1));
         assert!(index.is_alive_root(0));
@@ -3125,8 +3134,9 @@ pub mod tests {
     fn test_clean_and_unclean_slot() {
         let index = AccountsIndex::<bool>::default_for_tests();
         assert_eq!(0, index.roots_tracker.read().unwrap().uncleaned_roots.len());
-        index.add_root(0, false);
-        index.add_root(1, false);
+        index.add_root(0);
+        index.add_root(1);
+        index.add_uncleaned_roots([0, 1].into_iter());
         assert_eq!(2, index.roots_tracker.read().unwrap().uncleaned_roots.len());
 
         assert_eq!(
@@ -3151,8 +3161,9 @@ pub mod tests {
                 .len()
         );
 
-        index.add_root(2, false);
-        index.add_root(3, false);
+        index.add_root(2);
+        index.add_root(3);
+        index.add_uncleaned_roots([2, 3].into_iter());
         assert_eq!(4, index.roots_tracker.read().unwrap().alive_roots.len());
         assert_eq!(2, index.roots_tracker.read().unwrap().uncleaned_roots.len());
         assert_eq!(
@@ -3311,9 +3322,9 @@ pub mod tests {
             &mut gc,
             UPSERT_POPULATE_RECLAIMS,
         );
-        index.add_root(0, false);
-        index.add_root(1, false);
-        index.add_root(3, false);
+        index.add_root(0);
+        index.add_root(1);
+        index.add_root(3);
         index.upsert(
             4,
             4,
@@ -3385,7 +3396,7 @@ pub mod tests {
 
         let purges = index.purge_roots(&key);
         assert_eq!(purges, (vec![], false));
-        index.add_root(1, false);
+        index.add_root(1);
 
         let purges = index.purge_roots(&key);
         assert_eq!(purges, (vec![(1, 10)], true));
@@ -3413,7 +3424,7 @@ pub mod tests {
         assert!(index.latest_slot(None, &slot_slice, None).is_none());
 
         // Given a root, should return the root
-        index.add_root(5, false);
+        index.add_root(5);
         assert_eq!(index.latest_slot(None, &slot_slice, None).unwrap(), 1);
 
         // Given a max_root == root, should still return the root
@@ -3551,9 +3562,9 @@ pub mod tests {
 
         // Add a later root, earlier slots should be reclaimed
         slot_list = vec![(1, true), (2, true), (5, true), (9, true)];
-        index.add_root(1, false);
+        index.add_root(1);
         // Note 2 is not a root
-        index.add_root(5, false);
+        index.add_root(5);
         reclaims = vec![];
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, None);
         assert_eq!(reclaims, vec![(1, true), (2, true)]);
@@ -3561,7 +3572,7 @@ pub mod tests {
 
         // Add a later root that is not in the list, should not affect the outcome
         slot_list = vec![(1, true), (2, true), (5, true), (9, true)];
-        index.add_root(6, false);
+        index.add_root(6);
         reclaims = vec![];
         index.purge_older_root_entries(&mut slot_list, &mut reclaims, None);
         assert_eq!(reclaims, vec![(1, true), (2, true)]);
@@ -3832,7 +3843,7 @@ pub mod tests {
         // If we set a root at `later_slot`, and clean, then even though the account with secondary_key1
         // was outdated by the update in the later slot, the primary account key is still alive,
         // so both secondary keys will still be kept alive.
-        index.add_root(later_slot, false);
+        index.add_root(later_slot);
         index.slot_list_mut(&account_key, |slot_list| {
             index.purge_older_root_entries(slot_list, &mut vec![], None)
         });
@@ -3947,14 +3958,7 @@ pub mod tests {
         );
         assert_eq!((bins - 1, usize::MAX), iter.bin_start_and_range());
 
-        assert_eq!(
-            (0..2)
-                .into_iter()
-                .skip(1)
-                .take(usize::MAX)
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
+        assert_eq!((0..2).skip(1).take(usize::MAX).collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
@@ -3995,7 +3999,7 @@ pub mod tests {
             );
         }
 
-        index.add_root(slot2, true);
+        index.add_root(slot2);
 
         {
             let roots_tracker = &index.roots_tracker.read().unwrap();
@@ -4108,7 +4112,7 @@ pub mod tests {
         // re-add it
         index.upsert_simple_test(&key, slot1, value);
 
-        index.add_root(slot1, value);
+        index.add_root(slot1);
         assert!(!index.clean_rooted_entries(&key, &mut gc, Some(slot2)));
         index.upsert_simple_test(&key, slot2, value);
 
@@ -4147,7 +4151,7 @@ pub mod tests {
                     )
                 );
             }
-            index.add_root(slot2, true);
+            index.add_root(slot2);
             {
                 let roots_tracker = &index.roots_tracker.read().unwrap();
                 let slot_list = vec![(slot2, value)];

@@ -37,8 +37,8 @@ fn build_packet_batch(
                     1,
                     recent_blockhash.unwrap_or_else(Hash::new_unique),
                 );
-                let mut packet = Packet::from_data(None, &tx).unwrap();
-                packet.meta.sender_stake = sender_stake as u64;
+                let mut packet = Packet::from_data(None, tx).unwrap();
+                packet.meta_mut().sender_stake = sender_stake as u64;
                 packet
             })
             .collect(),
@@ -64,9 +64,9 @@ fn build_randomized_packet_batch(
                     1,
                     recent_blockhash.unwrap_or_else(Hash::new_unique),
                 );
-                let mut packet = Packet::from_data(None, &tx).unwrap();
+                let mut packet = Packet::from_data(None, tx).unwrap();
                 let sender_stake = distribution.sample(&mut rng);
-                packet.meta.sender_stake = sender_stake as u64;
+                packet.meta_mut().sender_stake = sender_stake as u64;
                 packet
             })
             .collect(),
@@ -120,8 +120,8 @@ fn bench_packet_clone(bencher: &mut Bencher) {
             let mut timer = Measure::start("insert_batch");
             packet_batch.iter().for_each(|packet| {
                 let mut packet = packet.clone();
-                packet.meta.sender_stake *= 2;
-                if packet.meta.sender_stake > 2 {
+                packet.meta_mut().sender_stake *= 2;
+                if packet.meta().sender_stake > 2 {
                     outer_packet = packet;
                 }
             });

@@ -19,10 +19,10 @@ use {
         packet::{Packet, PACKET_DATA_SIZE},
         pubkey::Pubkey,
         quic::{
-            QUIC_CONNECTION_HANDSHAKE_TIMEOUT_MS, QUIC_MAX_STAKED_RECEIVE_WINDOW_RATIO,
-            QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS, QUIC_MIN_STAKED_CONCURRENT_STREAMS,
-            QUIC_MIN_STAKED_RECEIVE_WINDOW_RATIO, QUIC_TOTAL_STAKED_CONCURRENT_STREAMS,
-            QUIC_UNSTAKED_RECEIVE_WINDOW_RATIO,
+            QUIC_CONNECTION_HANDSHAKE_TIMEOUT_MS, QUIC_MAX_STAKED_CONCURRENT_STREAMS,
+            QUIC_MAX_STAKED_RECEIVE_WINDOW_RATIO, QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS,
+            QUIC_MIN_STAKED_CONCURRENT_STREAMS, QUIC_MIN_STAKED_RECEIVE_WINDOW_RATIO,
+            QUIC_TOTAL_STAKED_CONCURRENT_STREAMS, QUIC_UNSTAKED_RECEIVE_WINDOW_RATIO,
         },
         signature::Keypair,
         timing,
@@ -71,10 +71,11 @@ pub fn spawn_server(
     max_unstaked_connections: usize,
     stats: Arc<StreamStats>,
     wait_for_chunk_timeout_ms: u64,
-) -> Result<JoinHandle<()>, QuicServerError> {
+) -> Result<(Endpoint, JoinHandle<()>), QuicServerError> {
+    info!("Start quic server on {:?}", sock);
     let (config, _cert) = configure_server(keypair, gossip_host)?;
 
-    let (_, incoming) = {
+    let (endpoint, incoming) = {
         Endpoint::new(EndpointConfig::default(), Some(config), sock)
             .map_err(|_e| QuicServerError::EndpointFailed)?
     };
@@ -90,7 +91,7 @@ pub fn spawn_server(
         stats,
         wait_for_chunk_timeout_ms,
     ));
-    Ok(handle)
+    Ok((endpoint, handle))
 }
 
 pub async fn run_server(
@@ -126,6 +127,7 @@ pub async fn run_server(
         }
 
         if let Ok(Some(connection)) = timeout_connection {
+            info!("Got a connection {:?}", connection.remote_address());
             tokio::spawn(setup_connection(
                 connection,
                 unstaked_connection_table.clone(),
@@ -139,6 +141,8 @@ pub async fn run_server(
                 wait_for_chunk_timeout_ms,
             ));
             sleep(Duration::from_micros(WAIT_BETWEEN_NEW_CONNECTIONS_US)).await;
+        } else {
+            info!("Timed out waiting for connection");
         }
     }
 }
@@ -205,8 +209,12 @@ pub fn compute_max_allowed_uni_streams(
                         - QUIC_MIN_STAKED_CONCURRENT_STREAMS)
                         as f64;
 
-                    ((peer_stake as f64 / total_stake as f64) * delta) as usize
-                        + QUIC_MIN_STAKED_CONCURRENT_STREAMS
+                    (((peer_stake as f64 / total_stake as f64) * delta) as usize
+                        + QUIC_MIN_STAKED_CONCURRENT_STREAMS)
+                        .clamp(
+                            QUIC_MIN_STAKED_CONCURRENT_STREAMS,
+                            QUIC_MAX_STAKED_CONCURRENT_STREAMS,
+                        )
                 }
             }
             _ => QUIC_MAX_UNSTAKED_CONCURRENT_STREAMS,
@@ -397,12 +405,12 @@ fn compute_recieve_window(
 ) -> Result<VarInt, VarIntBoundsExceeded> {
     match peer_type {
         ConnectionPeerType::Unstaked => {
-            VarInt::from_u64((PACKET_DATA_SIZE as u64 * QUIC_UNSTAKED_RECEIVE_WINDOW_RATIO) as u64)
+            VarInt::from_u64(PACKET_DATA_SIZE as u64 * QUIC_UNSTAKED_RECEIVE_WINDOW_RATIO)
         }
         ConnectionPeerType::Staked => {
             let ratio =
                 compute_receive_window_ratio_for_staked_node(max_stake, min_stake, peer_stake);
-            VarInt::from_u64((PACKET_DATA_SIZE as u64 * ratio) as u64)
+            VarInt::from_u64(PACKET_DATA_SIZE as u64 * ratio)
         }
     }
 }
@@ -558,9 +566,17 @@ async fn handle_connection(
                         let last_update = last_update.clone();
                         tokio::spawn(async move {
                             let mut maybe_batch = None;
+                            // The min is to guard against a value too small which can wake up unnecessarily
+                            // frequently and wasting CPU cycles. The max guard against waiting for too long
+                            // which delay exit and cause some test failures when the timeout value is large.
+                            // Within this value, the heuristic is to wake up 10 times to check for exit
+                            // for the set timeout if there are no data.
+                            let exit_check_interval =
+                                (wait_for_chunk_timeout_ms / 10).clamp(10, 1000);
+                            let mut start = Instant::now();
                             while !stream_exit.load(Ordering::Relaxed) {
                                 if let Ok(chunk) = tokio::time::timeout(
-                                    Duration::from_millis(wait_for_chunk_timeout_ms),
+                                    Duration::from_millis(exit_check_interval),
                                     stream.read_chunk(PACKET_DATA_SIZE, false),
                                 )
                                 .await
@@ -577,12 +593,16 @@ async fn handle_connection(
                                         last_update.store(timing::timestamp(), Ordering::Relaxed);
                                         break;
                                     }
+                                    start = Instant::now();
                                 } else {
-                                    debug!("Timeout in receiving on stream");
-                                    stats
-                                        .total_stream_read_timeouts
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    break;
+                                    let elapse = Instant::now() - start;
+                                    if elapse.as_millis() as u64 > wait_for_chunk_timeout_ms {
+                                        debug!("Timeout in receiving on stream");
+                                        stats
+                                            .total_stream_read_timeouts
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        break;
+                                    }
                                 }
                             }
                             stats.total_streams.fetch_sub(1, Ordering::Relaxed);
@@ -649,8 +669,8 @@ fn handle_chunk(
                 if maybe_batch.is_none() {
                     let mut batch = PacketBatch::with_capacity(1);
                     let mut packet = Packet::default();
-                    packet.meta.set_socket_addr(remote_addr);
-                    packet.meta.sender_stake = stake;
+                    packet.meta_mut().set_socket_addr(remote_addr);
+                    packet.meta_mut().sender_stake = stake;
                     batch.push(packet);
                     *maybe_batch = Some(batch);
                     stats
@@ -666,7 +686,7 @@ fn handle_chunk(
                     };
                     batch[0].buffer_mut()[chunk.offset as usize..end_of_chunk]
                         .copy_from_slice(&chunk.bytes);
-                    batch[0].meta.size = std::cmp::max(batch[0].meta.size, end_of_chunk);
+                    batch[0].meta_mut().size = std::cmp::max(batch[0].meta().size, end_of_chunk);
                     stats.total_chunks_received.fetch_add(1, Ordering::Relaxed);
                     match peer_type {
                         ConnectionPeerType::Staked => {
@@ -685,7 +705,7 @@ fn handle_chunk(
                 trace!("chunk is none");
                 // done receiving chunks
                 if let Some(batch) = maybe_batch.take() {
-                    let len = batch[0].meta.size;
+                    let len = batch[0].meta().size;
                     if let Err(e) = packet_sender.send(batch) {
                         stats
                             .total_packet_batch_send_err
@@ -1001,7 +1021,7 @@ pub mod test {
         let server_address = s.local_addr().unwrap();
         let staked_nodes = Arc::new(RwLock::new(option_staked_nodes.unwrap_or_default()));
         let stats = Arc::new(StreamStats::default());
-        let t = spawn_server(
+        let (_, t) = spawn_server(
             s,
             &keypair,
             ip,
@@ -1012,7 +1032,7 @@ pub mod test {
             MAX_STAKED_CONNECTIONS,
             MAX_UNSTAKED_CONNECTIONS,
             stats.clone(),
-            1,
+            2000,
         )
         .unwrap();
         (t, exit, receiver, server_address, stats)
@@ -1112,7 +1132,7 @@ pub mod test {
         }
         for batch in all_packets {
             for p in batch.iter() {
-                assert_eq!(p.meta.size, 1);
+                assert_eq!(p.meta().size, 1);
             }
         }
         assert_eq!(total_packets, num_expected_packets);
@@ -1148,7 +1168,7 @@ pub mod test {
         }
         for batch in all_packets {
             for p in batch.iter() {
-                assert_eq!(p.meta.size, num_bytes);
+                assert_eq!(p.meta().size, num_bytes);
             }
         }
         assert_eq!(total_packets, num_expected_packets);
@@ -1313,7 +1333,7 @@ pub mod test {
         let server_address = s.local_addr().unwrap();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
         let stats = Arc::new(StreamStats::default());
-        let t = spawn_server(
+        let (_, t) = spawn_server(
             s,
             &keypair,
             ip,
@@ -1344,7 +1364,7 @@ pub mod test {
         let server_address = s.local_addr().unwrap();
         let staked_nodes = Arc::new(RwLock::new(StakedNodes::default()));
         let stats = Arc::new(StreamStats::default());
-        let t = spawn_server(
+        let (_, t) = spawn_server(
             s,
             &keypair,
             ip,
@@ -1378,7 +1398,6 @@ pub mod test {
         let mut num_entries = 5;
         let max_connections_per_peer = 10;
         let sockets: Vec<_> = (0..num_entries)
-            .into_iter()
             .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i, 0, 0, 0)), 0))
             .collect();
         for (i, socket) in sockets.iter().enumerate() {
@@ -1431,10 +1450,7 @@ pub mod test {
         let num_entries = 15;
         let max_connections_per_peer = 10;
 
-        let pubkeys: Vec<_> = (0..num_entries)
-            .into_iter()
-            .map(|_| Pubkey::new_unique())
-            .collect();
+        let pubkeys: Vec<_> = (0..num_entries).map(|_| Pubkey::new_unique()).collect();
         for (i, pubkey) in pubkeys.iter().enumerate() {
             table
                 .try_add_connection(
@@ -1506,11 +1522,11 @@ pub mod test {
             )
             .is_some());
 
-        assert_eq!(table.total_size, num_entries as usize);
+        assert_eq!(table.total_size, num_entries);
 
         let new_max_size = 3;
         let pruned = table.prune_oldest(new_max_size);
-        assert!(pruned >= num_entries as usize - new_max_size);
+        assert!(pruned >= num_entries - new_max_size);
         assert!(table.table.len() <= new_max_size);
         assert!(table.total_size <= new_max_size);
 
@@ -1526,7 +1542,6 @@ pub mod test {
         let num_entries = 5;
         let max_connections_per_peer = 10;
         let sockets: Vec<_> = (0..num_entries)
-            .into_iter()
             .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i, 0, 0, 0)), 0))
             .collect();
         for (i, socket) in sockets.iter().enumerate() {
@@ -1561,7 +1576,6 @@ pub mod test {
         let num_ips = 5;
         let max_connections_per_peer = 10;
         let mut sockets: Vec<_> = (0..num_ips)
-            .into_iter()
             .map(|i| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i, 0, 0, 0)), 0))
             .collect();
         for (i, socket) in sockets.iter().enumerate() {
@@ -1636,7 +1650,7 @@ pub mod test {
             (QUIC_TOTAL_STAKED_CONCURRENT_STREAMS - QUIC_MIN_STAKED_CONCURRENT_STREAMS) as f64;
         assert_eq!(
             compute_max_allowed_uni_streams(ConnectionPeerType::Staked, 1000, 10000),
-            (delta / (10_f64)) as usize + QUIC_MIN_STAKED_CONCURRENT_STREAMS
+            QUIC_MAX_STAKED_CONCURRENT_STREAMS,
         );
         assert_eq!(
             compute_max_allowed_uni_streams(ConnectionPeerType::Staked, 100, 10000),

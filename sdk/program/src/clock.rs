@@ -7,7 +7,7 @@
 //! by their slot number, and some slots do not contain a block.
 //!
 //! An approximation of the passage of real-world time can be calculated by
-//! multiplying a number of slots by [`SLOT_MS`], which is a constant target
+//! multiplying a number of slots by [`DEFAULT_MS_PER_SLOT`], which is a constant target
 //! time for the network to produce slots. Note though that this method suffers
 //! a variable amount of drift, as the network does not produce slots at exactly
 //! the target rate, and the greater number of slots being calculated for, the
@@ -20,10 +20,7 @@
 //!
 //! [oracle]: https://docs.solana.com/implemented-proposals/validator-timestamp-oracle
 
-use {
-    crate::{clone_zeroed, copy_field},
-    std::mem::MaybeUninit,
-};
+use solana_sdk_macro::CloneZeroed;
 
 /// The default tick rate that the cluster attempts to achieve (160 per second).
 ///
@@ -36,11 +33,9 @@ static_assertions::const_assert_eq!(MS_PER_TICK, 6);
 /// The number of milliseconds per tick (6).
 pub const MS_PER_TICK: u64 = 1000 / DEFAULT_TICKS_PER_SECOND;
 
-#[cfg(test)]
-static_assertions::const_assert_eq!(SLOT_MS, 400);
-
+#[deprecated(since = "1.15.0", note = "Please use DEFAULT_MS_PER_SLOT instead")]
 /// The expected duration of a slot (400 milliseconds).
-pub const SLOT_MS: u64 = (DEFAULT_TICKS_PER_SLOT * 1000) / DEFAULT_TICKS_PER_SECOND;
+pub const SLOT_MS: u64 = DEFAULT_MS_PER_SLOT;
 
 // At 160 ticks/s, 64 ticks per slot implies that leader rotation and voting will happen
 // every 400 ms. A fast voting cadence ensures faster finality and convergence
@@ -77,6 +72,7 @@ pub const NUM_CONSECUTIVE_LEADER_SLOTS: u64 = 4;
 
 #[cfg(test)]
 static_assertions::const_assert_eq!(DEFAULT_MS_PER_SLOT, 400);
+/// The expected duration of a slot (400 milliseconds).
 pub const DEFAULT_MS_PER_SLOT: u64 = 1_000 * DEFAULT_TICKS_PER_SLOT / DEFAULT_TICKS_PER_SECOND;
 pub const DEFAULT_S_PER_SLOT: f64 = DEFAULT_TICKS_PER_SLOT as f64 / DEFAULT_TICKS_PER_SECOND as f64;
 
@@ -147,7 +143,7 @@ pub type UnixTimestamp = i64;
 ///
 /// All members of `Clock` start from 0 upon network boot.
 #[repr(C)]
-#[derive(Serialize, Deserialize, Debug, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, CloneZeroed, Default, PartialEq, Eq)]
 pub struct Clock {
     /// The current `Slot`.
     pub slot: Slot,
@@ -168,21 +164,6 @@ pub struct Clock {
     /// [tsc]: https://docs.solana.com/implemented-proposals/bank-timestamp-correction
     /// [oracle]: https://docs.solana.com/implemented-proposals/validator-timestamp-oracle
     pub unix_timestamp: UnixTimestamp,
-}
-
-impl Clone for Clock {
-    fn clone(&self) -> Self {
-        clone_zeroed(|cloned: &mut MaybeUninit<Self>| {
-            let ptr = cloned.as_mut_ptr();
-            unsafe {
-                copy_field!(ptr, self, slot);
-                copy_field!(ptr, self, epoch_start_timestamp);
-                copy_field!(ptr, self, epoch);
-                copy_field!(ptr, self, leader_schedule_epoch);
-                copy_field!(ptr, self, unix_timestamp);
-            }
-        })
-    }
 }
 
 #[cfg(test)]

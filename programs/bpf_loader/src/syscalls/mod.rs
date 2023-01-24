@@ -13,34 +13,38 @@ pub use self::{
 use {
     crate::BpfError,
     solana_program_runtime::{
-        ic_logger_msg, ic_msg,
-        invoke_context::{ComputeMeter, InvokeContext},
-        stable_log,
-        timings::ExecuteTimings,
+        compute_budget::ComputeBudget, ic_logger_msg, ic_msg, invoke_context::InvokeContext,
+        stable_log, timings::ExecuteTimings,
     },
     solana_rbpf::{
         error::EbpfError,
         memory_region::{AccessType, MemoryMapping},
-        vm::{ProgramResult, SyscallRegistry},
+        vm::{BuiltInProgram, Config, ProgramResult, PROGRAM_ENVIRONMENT_KEY_SHIFT},
     },
     solana_sdk::{
         account::{ReadableAccount, WritableAccount},
         account_info::AccountInfo,
+        alt_bn128::prelude::{
+            alt_bn128_addition, alt_bn128_multiplication, alt_bn128_pairing, AltBn128Error,
+            ALT_BN128_ADDITION_OUTPUT_LEN, ALT_BN128_MULTIPLICATION_OUTPUT_LEN,
+            ALT_BN128_PAIRING_ELEMENT_LEN, ALT_BN128_PAIRING_OUTPUT_LEN,
+        },
         blake3, bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
         entrypoint::{BPF_ALIGN_OF_U128, MAX_PERMITTED_DATA_INCREASE, SUCCESS},
         feature_set::FeatureSet,
         feature_set::{
-            self, blake3_syscall_enabled, check_physical_overlapping,
-            check_syscall_outputs_do_not_overlap, curve25519_syscall_enabled,
-            disable_cpi_setting_executable_and_rent_epoch, disable_fees_sysvar,
-            enable_early_verification_of_account_modifications, libsecp256k1_0_5_upgrade_enabled,
-            limit_secp256k1_recovery_id, stop_sibling_instruction_search_at_parent,
-            syscall_saturated_math,
+            self, blake3_syscall_enabled, check_syscall_outputs_do_not_overlap,
+            curve25519_syscall_enabled, disable_cpi_setting_executable_and_rent_epoch,
+            disable_fees_sysvar, enable_alt_bn128_syscall,
+            enable_early_verification_of_account_modifications,
+            error_on_syscall_bpf_function_hash_collisions, libsecp256k1_0_5_upgrade_enabled,
+            limit_secp256k1_recovery_id, reject_callx_r10,
+            stop_sibling_instruction_search_at_parent,
         },
         hash::{Hasher, HASH_BYTES},
         instruction::{
-            AccountMeta, AccountPropertyUpdate, Instruction, InstructionError,
-            ProcessedSiblingInstruction, TRANSACTION_LEVEL_STACK_HEIGHT,
+            AccountMeta, Instruction, InstructionError, ProcessedSiblingInstruction,
+            TRANSACTION_LEVEL_STACK_HEIGHT,
         },
         keccak, native_loader,
         precompiles::is_precompile,
@@ -51,13 +55,11 @@ use {
             Secp256k1RecoverError, SECP256K1_PUBLIC_KEY_LENGTH, SECP256K1_SIGNATURE_LENGTH,
         },
         sysvar::{Sysvar, SysvarId},
-        transaction_context::{IndexOfAccount, InstructionAccount, TransactionContextAttribute},
+        transaction_context::{IndexOfAccount, InstructionAccount},
     },
     std::{
         alloc::Layout,
-        cell::RefCell,
         mem::{align_of, size_of},
-        rc::Rc,
         slice::from_raw_parts_mut,
         str::{from_utf8, Utf8Error},
         sync::Arc,
@@ -129,165 +131,187 @@ impl From<SyscallError> for EbpfError {
     }
 }
 
-trait SyscallConsume {
-    fn consume(&mut self, amount: u64) -> Result<(), EbpfError>;
-}
-impl SyscallConsume for Rc<RefCell<ComputeMeter>> {
-    fn consume(&mut self, amount: u64) -> Result<(), EbpfError> {
-        self.try_borrow_mut()
-            .map_err(|_| SyscallError::InvokeContextBorrowFailed)?
-            .consume(amount)
-            .map_err(SyscallError::InstructionError)?;
-        Ok(())
-    }
+fn consume_compute_meter(invoke_context: &InvokeContext, amount: u64) -> Result<(), EbpfError> {
+    invoke_context
+        .consume_checked(amount)
+        .map_err(SyscallError::InstructionError)?;
+    Ok(())
 }
 
-macro_rules! register_feature_gated_syscall {
-    ($syscall_registry:expr, $is_feature_active:expr, $name:expr, $call:expr $(,)?) => {
+macro_rules! register_feature_gated_function {
+    ($result:expr, $is_feature_active:expr, $name:expr, $call:expr $(,)?) => {
         if $is_feature_active {
-            $syscall_registry.register_syscall_by_name($name, $call)
+            $result.register_function_by_name($name, $call)
         } else {
             Ok(())
         }
     };
 }
 
-pub fn register_syscalls(
+pub fn create_loader<'a>(
     feature_set: &FeatureSet,
+    compute_budget: &ComputeBudget,
+    reject_deployment_of_broken_elfs: bool,
     disable_deploy_of_alloc_free_syscall: bool,
-) -> Result<SyscallRegistry, EbpfError> {
+    debugging_features: bool,
+) -> Result<Arc<BuiltInProgram<InvokeContext<'a>>>, EbpfError> {
+    use rand::Rng;
+    let config = Config {
+        max_call_depth: compute_budget.max_call_depth,
+        stack_frame_size: compute_budget.stack_frame_size,
+        enable_stack_frame_gaps: true,
+        instruction_meter_checkpoint_distance: 10000,
+        enable_instruction_meter: true,
+        enable_instruction_tracing: debugging_features,
+        enable_symbol_and_section_labels: debugging_features,
+        reject_broken_elfs: reject_deployment_of_broken_elfs,
+        noop_instruction_rate: 256,
+        sanitize_user_provided_values: true,
+        runtime_environment_key: rand::thread_rng()
+            .gen::<i32>()
+            .checked_shr(PROGRAM_ENVIRONMENT_KEY_SHIFT)
+            .unwrap_or(0),
+        external_internal_function_hash_collision: feature_set
+            .is_active(&error_on_syscall_bpf_function_hash_collisions::id()),
+        reject_callx_r10: feature_set.is_active(&reject_callx_r10::id()),
+        dynamic_stack_frames: false,
+        enable_sdiv: false,
+        optimize_rodata: false,
+        static_syscalls: false,
+        enable_elf_vaddr: false,
+        reject_rodata_stack_overlap: false,
+        new_elf_parser: false,
+        aligned_memory_mapping: true,
+        // Warning, do not use `Config::default()` so that configuration here is explicit.
+    };
+
+    let enable_alt_bn128_syscall = feature_set.is_active(&enable_alt_bn128_syscall::id());
     let blake3_syscall_enabled = feature_set.is_active(&blake3_syscall_enabled::id());
     let curve25519_syscall_enabled = feature_set.is_active(&curve25519_syscall_enabled::id());
     let disable_fees_sysvar = feature_set.is_active(&disable_fees_sysvar::id());
     let is_abi_v2 = false;
 
-    let mut syscall_registry = SyscallRegistry::default();
+    let mut result = BuiltInProgram::new_loader(config);
 
     // Abort
-    syscall_registry.register_syscall_by_name(b"abort", SyscallAbort::call)?;
+    result.register_function_by_name("abort", SyscallAbort::call)?;
 
     // Panic
-    syscall_registry.register_syscall_by_name(b"sol_panic_", SyscallPanic::call)?;
+    result.register_function_by_name("sol_panic_", SyscallPanic::call)?;
 
     // Logging
-    syscall_registry.register_syscall_by_name(b"sol_log_", SyscallLog::call)?;
-    syscall_registry.register_syscall_by_name(b"sol_log_64_", SyscallLogU64::call)?;
-    syscall_registry
-        .register_syscall_by_name(b"sol_log_compute_units_", SyscallLogBpfComputeUnits::call)?;
-    syscall_registry.register_syscall_by_name(b"sol_log_pubkey", SyscallLogPubkey::call)?;
+    result.register_function_by_name("sol_log_", SyscallLog::call)?;
+    result.register_function_by_name("sol_log_64_", SyscallLogU64::call)?;
+    result.register_function_by_name("sol_log_compute_units_", SyscallLogBpfComputeUnits::call)?;
+    result.register_function_by_name("sol_log_pubkey", SyscallLogPubkey::call)?;
 
     // Program defined addresses (PDA)
-    syscall_registry.register_syscall_by_name(
-        b"sol_create_program_address",
+    result.register_function_by_name(
+        "sol_create_program_address",
         SyscallCreateProgramAddress::call,
     )?;
-    syscall_registry.register_syscall_by_name(
-        b"sol_try_find_program_address",
+    result.register_function_by_name(
+        "sol_try_find_program_address",
         SyscallTryFindProgramAddress::call,
     )?;
 
     // Sha256
-    syscall_registry.register_syscall_by_name(b"sol_sha256", SyscallSha256::call)?;
+    result.register_function_by_name("sol_sha256", SyscallSha256::call)?;
 
     // Keccak256
-    syscall_registry.register_syscall_by_name(b"sol_keccak256", SyscallKeccak256::call)?;
+    result.register_function_by_name("sol_keccak256", SyscallKeccak256::call)?;
 
     // Secp256k1 Recover
-    syscall_registry
-        .register_syscall_by_name(b"sol_secp256k1_recover", SyscallSecp256k1Recover::call)?;
+    result.register_function_by_name("sol_secp256k1_recover", SyscallSecp256k1Recover::call)?;
 
     // Blake3
-    register_feature_gated_syscall!(
-        syscall_registry,
+    register_feature_gated_function!(
+        result,
         blake3_syscall_enabled,
-        b"sol_blake3",
+        "sol_blake3",
         SyscallBlake3::call,
     )?;
 
     // Elliptic Curve Operations
-    register_feature_gated_syscall!(
-        syscall_registry,
+    register_feature_gated_function!(
+        result,
         curve25519_syscall_enabled,
-        b"sol_curve_validate_point",
+        "sol_curve_validate_point",
         SyscallCurvePointValidation::call,
     )?;
-    register_feature_gated_syscall!(
-        syscall_registry,
+    register_feature_gated_function!(
+        result,
         curve25519_syscall_enabled,
-        b"sol_curve_group_op",
+        "sol_curve_group_op",
         SyscallCurveGroupOps::call,
     )?;
-    register_feature_gated_syscall!(
-        syscall_registry,
+    register_feature_gated_function!(
+        result,
         curve25519_syscall_enabled,
-        b"sol_curve_multiscalar_mul",
+        "sol_curve_multiscalar_mul",
         SyscallCurveMultiscalarMultiplication::call,
     )?;
 
     // Sysvars
-    syscall_registry
-        .register_syscall_by_name(b"sol_get_clock_sysvar", SyscallGetClockSysvar::call)?;
-    syscall_registry.register_syscall_by_name(
-        b"sol_get_epoch_schedule_sysvar",
+    result.register_function_by_name("sol_get_clock_sysvar", SyscallGetClockSysvar::call)?;
+    result.register_function_by_name(
+        "sol_get_epoch_schedule_sysvar",
         SyscallGetEpochScheduleSysvar::call,
     )?;
-    register_feature_gated_syscall!(
-        syscall_registry,
+    register_feature_gated_function!(
+        result,
         !disable_fees_sysvar,
-        b"sol_get_fees_sysvar",
+        "sol_get_fees_sysvar",
         SyscallGetFeesSysvar::call,
     )?;
-    syscall_registry
-        .register_syscall_by_name(b"sol_get_rent_sysvar", SyscallGetRentSysvar::call)?;
+    result.register_function_by_name("sol_get_rent_sysvar", SyscallGetRentSysvar::call)?;
 
     // Memory ops
-    syscall_registry.register_syscall_by_name(b"sol_memcpy_", SyscallMemcpy::call)?;
-    syscall_registry.register_syscall_by_name(b"sol_memmove_", SyscallMemmove::call)?;
-    syscall_registry.register_syscall_by_name(b"sol_memcmp_", SyscallMemcmp::call)?;
-    syscall_registry.register_syscall_by_name(b"sol_memset_", SyscallMemset::call)?;
+    result.register_function_by_name("sol_memcpy_", SyscallMemcpy::call)?;
+    result.register_function_by_name("sol_memmove_", SyscallMemmove::call)?;
+    result.register_function_by_name("sol_memcmp_", SyscallMemcmp::call)?;
+    result.register_function_by_name("sol_memset_", SyscallMemset::call)?;
 
-    if is_abi_v2 {
-        // Set account attributes
-        syscall_registry.register_syscall_by_name(
-            b"sol_set_account_attributes",
-            SyscallSetAccountProperties::call,
-        )?;
-    } else {
+    if !is_abi_v2 {
         // Processed sibling instructions
-        syscall_registry.register_syscall_by_name(
-            b"sol_get_processed_sibling_instruction",
+        result.register_function_by_name(
+            "sol_get_processed_sibling_instruction",
             SyscallGetProcessedSiblingInstruction::call,
         )?;
 
         // Stack height
-        syscall_registry
-            .register_syscall_by_name(b"sol_get_stack_height", SyscallGetStackHeight::call)?;
+        result.register_function_by_name("sol_get_stack_height", SyscallGetStackHeight::call)?;
 
         // Return data
-        syscall_registry
-            .register_syscall_by_name(b"sol_set_return_data", SyscallSetReturnData::call)?;
-        syscall_registry
-            .register_syscall_by_name(b"sol_get_return_data", SyscallGetReturnData::call)?;
+        result.register_function_by_name("sol_set_return_data", SyscallSetReturnData::call)?;
+        result.register_function_by_name("sol_get_return_data", SyscallGetReturnData::call)?;
 
         // Cross-program invocation
-        syscall_registry
-            .register_syscall_by_name(b"sol_invoke_signed_c", SyscallInvokeSignedC::call)?;
-        syscall_registry
-            .register_syscall_by_name(b"sol_invoke_signed_rust", SyscallInvokeSignedRust::call)?;
+        result.register_function_by_name("sol_invoke_signed_c", SyscallInvokeSignedC::call)?;
+        result
+            .register_function_by_name("sol_invoke_signed_rust", SyscallInvokeSignedRust::call)?;
 
         // Memory allocator
-        register_feature_gated_syscall!(
-            syscall_registry,
+        register_feature_gated_function!(
+            result,
             !disable_deploy_of_alloc_free_syscall,
-            b"sol_alloc_free_",
+            "sol_alloc_free_",
             SyscallAllocFree::call,
+        )?;
+
+        // Alt_bn128
+        register_feature_gated_function!(
+            result,
+            enable_alt_bn128_syscall,
+            "sol_alt_bn128_group_op",
+            SyscallAltBn128::call,
         )?;
     }
 
     // Log data
-    syscall_registry.register_syscall_by_name(b"sol_log_data", SyscallLogData::call)?;
+    result.register_function_by_name("sol_log_data", SyscallLogData::call)?;
 
-    Ok(syscall_registry)
+    Ok(Arc::new(result))
 }
 
 fn translate(
@@ -296,7 +320,7 @@ fn translate(
     vm_addr: u64,
     len: u64,
 ) -> Result<u64, EbpfError> {
-    memory_mapping.map(access_type, vm_addr, len).into()
+    memory_mapping.map(access_type, vm_addr, len, 0).into()
 }
 
 fn translate_type_inner<'a, T>(
@@ -341,7 +365,7 @@ fn translate_slice_inner<'a, T>(
     }
 
     let total_size = len.saturating_mul(size_of::<T>() as u64);
-    if check_size & isize::try_from(total_size).is_err() {
+    if check_size && isize::try_from(total_size).is_err() {
         return Err(SyscallError::InvalidLength.into());
     }
 
@@ -466,7 +490,7 @@ declare_syscall!(
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, EbpfError> {
-        invoke_context.get_compute_meter().consume(len)?;
+        consume_compute_meter(invoke_context, len)?;
 
         translate_string_and_do(
             memory_mapping,
@@ -516,7 +540,7 @@ declare_syscall!(
         };
         if free_addr == 0 {
             match allocator.alloc(layout) {
-                Ok(addr) => Ok(addr as u64),
+                Ok(addr) => Ok(addr),
                 Err(_) => Ok(0),
             }
         } else {
@@ -578,7 +602,7 @@ declare_syscall!(
         let cost = invoke_context
             .get_compute_budget()
             .create_program_address_units;
-        invoke_context.get_compute_meter().consume(cost)?;
+        consume_compute_meter(invoke_context, cost)?;
 
         let (seeds, program_id) = translate_and_check_program_address_inputs(
             seeds_addr,
@@ -622,7 +646,7 @@ declare_syscall!(
         let cost = invoke_context
             .get_compute_budget()
             .create_program_address_units;
-        invoke_context.get_compute_meter().consume(cost)?;
+        consume_compute_meter(invoke_context, cost)?;
 
         let (seeds, program_id) = translate_and_check_program_address_inputs(
             seeds_addr,
@@ -671,7 +695,7 @@ declare_syscall!(
                 }
             }
             bump_seed[0] = bump_seed[0].saturating_sub(1);
-            invoke_context.get_compute_meter().consume(cost)?;
+            consume_compute_meter(invoke_context, cost)?;
         }
         Ok(1)
     }
@@ -700,9 +724,7 @@ declare_syscall!(
             return Err(SyscallError::TooManySlices.into());
         }
 
-        invoke_context
-            .get_compute_meter()
-            .consume(compute_budget.sha256_base_cost)?;
+        consume_compute_meter(invoke_context, compute_budget.sha256_base_cost)?;
 
         let hash_result = translate_slice_mut::<u8>(
             memory_mapping,
@@ -733,7 +755,7 @@ declare_syscall!(
                         .sha256_byte_cost
                         .saturating_mul((val.len() as u64).saturating_div(2)),
                 );
-                invoke_context.get_compute_meter().consume(cost)?;
+                consume_compute_meter(invoke_context, cost)?;
                 hasher.hash(bytes);
             }
         }
@@ -765,9 +787,7 @@ declare_syscall!(
             return Err(SyscallError::TooManySlices.into());
         }
 
-        invoke_context
-            .get_compute_meter()
-            .consume(compute_budget.sha256_base_cost)?;
+        consume_compute_meter(invoke_context, compute_budget.sha256_base_cost)?;
 
         let hash_result = translate_slice_mut::<u8>(
             memory_mapping,
@@ -798,7 +818,7 @@ declare_syscall!(
                         .sha256_byte_cost
                         .saturating_mul((val.len() as u64).saturating_div(2)),
                 );
-                invoke_context.get_compute_meter().consume(cost)?;
+                consume_compute_meter(invoke_context, cost)?;
                 hasher.hash(bytes);
             }
         }
@@ -820,7 +840,7 @@ declare_syscall!(
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, EbpfError> {
         let cost = invoke_context.get_compute_budget().secp256k1_recover_cost;
-        invoke_context.get_compute_meter().consume(cost)?;
+        consume_compute_meter(invoke_context, cost)?;
 
         let hash = translate_slice::<u8>(
             memory_mapping,
@@ -917,7 +937,7 @@ declare_syscall!(
                 let cost = invoke_context
                     .get_compute_budget()
                     .curve25519_edwards_validate_point_cost;
-                invoke_context.get_compute_meter().consume(cost)?;
+                consume_compute_meter(invoke_context, cost)?;
 
                 let point = translate_type::<edwards::PodEdwardsPoint>(
                     memory_mapping,
@@ -935,7 +955,7 @@ declare_syscall!(
                 let cost = invoke_context
                     .get_compute_budget()
                     .curve25519_ristretto_validate_point_cost;
-                invoke_context.get_compute_meter().consume(cost)?;
+                consume_compute_meter(invoke_context, cost)?;
 
                 let point = translate_type::<ristretto::PodRistrettoPoint>(
                     memory_mapping,
@@ -977,7 +997,7 @@ declare_syscall!(
                     let cost = invoke_context
                         .get_compute_budget()
                         .curve25519_edwards_add_cost;
-                    invoke_context.get_compute_meter().consume(cost)?;
+                    consume_compute_meter(invoke_context, cost)?;
 
                     let left_point = translate_type::<edwards::PodEdwardsPoint>(
                         memory_mapping,
@@ -1005,7 +1025,7 @@ declare_syscall!(
                     let cost = invoke_context
                         .get_compute_budget()
                         .curve25519_edwards_subtract_cost;
-                    invoke_context.get_compute_meter().consume(cost)?;
+                    consume_compute_meter(invoke_context, cost)?;
 
                     let left_point = translate_type::<edwards::PodEdwardsPoint>(
                         memory_mapping,
@@ -1033,7 +1053,7 @@ declare_syscall!(
                     let cost = invoke_context
                         .get_compute_budget()
                         .curve25519_edwards_multiply_cost;
-                    invoke_context.get_compute_meter().consume(cost)?;
+                    consume_compute_meter(invoke_context, cost)?;
 
                     let scalar = translate_type::<scalar::PodScalar>(
                         memory_mapping,
@@ -1065,7 +1085,7 @@ declare_syscall!(
                     let cost = invoke_context
                         .get_compute_budget()
                         .curve25519_ristretto_add_cost;
-                    invoke_context.get_compute_meter().consume(cost)?;
+                    consume_compute_meter(invoke_context, cost)?;
 
                     let left_point = translate_type::<ristretto::PodRistrettoPoint>(
                         memory_mapping,
@@ -1093,7 +1113,7 @@ declare_syscall!(
                     let cost = invoke_context
                         .get_compute_budget()
                         .curve25519_ristretto_subtract_cost;
-                    invoke_context.get_compute_meter().consume(cost)?;
+                    consume_compute_meter(invoke_context, cost)?;
 
                     let left_point = translate_type::<ristretto::PodRistrettoPoint>(
                         memory_mapping,
@@ -1123,7 +1143,7 @@ declare_syscall!(
                     let cost = invoke_context
                         .get_compute_budget()
                         .curve25519_ristretto_multiply_cost;
-                    invoke_context.get_compute_meter().consume(cost)?;
+                    consume_compute_meter(invoke_context, cost)?;
 
                     let scalar = translate_type::<scalar::PodScalar>(
                         memory_mapping,
@@ -1183,7 +1203,7 @@ declare_syscall!(
                             .curve25519_edwards_msm_incremental_cost
                             .saturating_mul(points_len.saturating_sub(1)),
                     );
-                invoke_context.get_compute_meter().consume(cost)?;
+                consume_compute_meter(invoke_context, cost)?;
 
                 let scalars = translate_slice::<scalar::PodScalar>(
                     memory_mapping,
@@ -1223,7 +1243,7 @@ declare_syscall!(
                             .curve25519_ristretto_msm_incremental_cost
                             .saturating_mul(points_len.saturating_sub(1)),
                     );
-                invoke_context.get_compute_meter().consume(cost)?;
+                consume_compute_meter(invoke_context, cost)?;
 
                 let scalars = translate_slice::<scalar::PodScalar>(
                     memory_mapping,
@@ -1283,9 +1303,7 @@ declare_syscall!(
             return Err(SyscallError::TooManySlices.into());
         }
 
-        invoke_context
-            .get_compute_meter()
-            .consume(compute_budget.sha256_base_cost)?;
+        consume_compute_meter(invoke_context, compute_budget.sha256_base_cost)?;
 
         let hash_result = translate_slice_mut::<u8>(
             memory_mapping,
@@ -1316,7 +1334,7 @@ declare_syscall!(
                         .sha256_byte_cost
                         .saturating_mul((val.len() as u64).saturating_div(2)),
                 );
-                invoke_context.get_compute_meter().consume(cost)?;
+                consume_compute_meter(invoke_context, cost)?;
                 hasher.hash(bytes);
             }
         }
@@ -1339,19 +1357,10 @@ declare_syscall!(
     ) -> Result<u64, EbpfError> {
         let budget = invoke_context.get_compute_budget();
 
-        let cost = if invoke_context
-            .feature_set
-            .is_active(&syscall_saturated_math::id())
-        {
-            len.saturating_div(budget.cpi_bytes_per_unit)
-                .saturating_add(budget.syscall_base_cost)
-        } else {
-            #[allow(clippy::integer_arithmetic)]
-            {
-                len / budget.cpi_bytes_per_unit + budget.syscall_base_cost
-            }
-        };
-        invoke_context.get_compute_meter().consume(cost)?;
+        let cost = len
+            .saturating_div(budget.cpi_bytes_per_unit)
+            .saturating_add(budget.syscall_base_cost);
+        consume_compute_meter(invoke_context, cost)?;
 
         if len > MAX_RETURN_DATA as u64 {
             return Err(SyscallError::ReturnDataTooLarge(len, MAX_RETURN_DATA as u64).into());
@@ -1399,27 +1408,15 @@ declare_syscall!(
     ) -> Result<u64, EbpfError> {
         let budget = invoke_context.get_compute_budget();
 
-        invoke_context
-            .get_compute_meter()
-            .consume(budget.syscall_base_cost)?;
+        consume_compute_meter(invoke_context, budget.syscall_base_cost)?;
 
         let (program_id, return_data) = invoke_context.transaction_context.get_return_data();
         length = length.min(return_data.len() as u64);
         if length != 0 {
-            let cost = if invoke_context
-                .feature_set
-                .is_active(&syscall_saturated_math::id())
-            {
-                length
-                    .saturating_add(size_of::<Pubkey>() as u64)
-                    .saturating_div(budget.cpi_bytes_per_unit)
-            } else {
-                #[allow(clippy::integer_arithmetic)]
-                {
-                    (length + size_of::<Pubkey>() as u64) / budget.cpi_bytes_per_unit
-                }
-            };
-            invoke_context.get_compute_meter().consume(cost)?;
+            let cost = length
+                .saturating_add(size_of::<Pubkey>() as u64)
+                .saturating_div(budget.cpi_bytes_per_unit);
+            consume_compute_meter(invoke_context, cost)?;
 
             let return_data_result = translate_slice_mut::<u8>(
                 memory_mapping,
@@ -1478,9 +1475,7 @@ declare_syscall!(
     ) -> Result<u64, EbpfError> {
         let budget = invoke_context.get_compute_budget();
 
-        invoke_context
-            .get_compute_meter()
-            .consume(budget.syscall_base_cost)?;
+        consume_compute_meter(invoke_context, budget.syscall_base_cost)?;
         let stop_sibling_instruction_search_at_parent = invoke_context
             .feature_set
             .is_active(&stop_sibling_instruction_search_at_parent::id());
@@ -1532,14 +1527,14 @@ declare_syscall!(
                 let data = translate_slice_mut::<u8>(
                     memory_mapping,
                     data_addr,
-                    result_header.data_len as u64,
+                    result_header.data_len,
                     invoke_context.get_check_aligned(),
                     invoke_context.get_check_size(),
                 )?;
                 let accounts = translate_slice_mut::<AccountMeta>(
                     memory_mapping,
                     accounts_addr,
-                    result_header.accounts_len as u64,
+                    result_header.accounts_len,
                     invoke_context.get_check_aligned(),
                     invoke_context.get_check_size(),
                 )?;
@@ -1632,82 +1627,94 @@ declare_syscall!(
     ) -> Result<u64, EbpfError> {
         let budget = invoke_context.get_compute_budget();
 
-        invoke_context
-            .get_compute_meter()
-            .consume(budget.syscall_base_cost)?;
+        consume_compute_meter(invoke_context, budget.syscall_base_cost)?;
 
         Ok(invoke_context.get_stack_height() as u64)
     }
 );
 
 declare_syscall!(
-    /// Update the properties of accounts
-    SyscallSetAccountProperties,
+    /// alt_bn128 group operations
+    SyscallAltBn128,
     fn inner_call(
         invoke_context: &mut InvokeContext,
-        updates_addr: u64,
-        updates_count: u64,
-        _arg3: u64,
-        _arg4: u64,
+        group_op: u64,
+        input_addr: u64,
+        input_size: u64,
+        result_addr: u64,
         _arg5: u64,
         memory_mapping: &mut MemoryMapping,
     ) -> Result<u64, EbpfError> {
+        use solana_sdk::alt_bn128::prelude::{ALT_BN128_ADD, ALT_BN128_MUL, ALT_BN128_PAIRING};
         let budget = invoke_context.get_compute_budget();
-
-        invoke_context.get_compute_meter().consume(
-            budget.syscall_base_cost.saturating_add(
-                budget
-                    .account_property_update_cost
-                    .saturating_mul(updates_count),
+        let (cost, output): (u64, usize) = match group_op {
+            ALT_BN128_ADD => (
+                budget.alt_bn128_addition_cost,
+                ALT_BN128_ADDITION_OUTPUT_LEN,
             ),
-        )?;
-        let transaction_context = &invoke_context.transaction_context;
-        let instruction_context = transaction_context
-            .get_current_instruction_context()
-            .map_err(SyscallError::InstructionError)?;
-        let updates = translate_slice::<AccountPropertyUpdate>(
+            ALT_BN128_MUL => (
+                budget.alt_bn128_multiplication_cost,
+                ALT_BN128_MULTIPLICATION_OUTPUT_LEN,
+            ),
+            ALT_BN128_PAIRING => {
+                let ele_len = input_size.saturating_div(ALT_BN128_PAIRING_ELEMENT_LEN as u64);
+                let cost = budget
+                    .alt_bn128_pairing_one_pair_cost_first
+                    .saturating_add(
+                        budget
+                            .alt_bn128_pairing_one_pair_cost_other
+                            .saturating_mul(ele_len.saturating_sub(1)),
+                    )
+                    .saturating_add(budget.sha256_base_cost)
+                    .saturating_add(input_size)
+                    .saturating_add(ALT_BN128_PAIRING_OUTPUT_LEN as u64);
+                (cost, ALT_BN128_PAIRING_OUTPUT_LEN)
+            }
+            _ => {
+                return Err(SyscallError::InvalidAttribute.into());
+            }
+        };
+
+        consume_compute_meter(invoke_context, cost)?;
+
+        let input = translate_slice::<u8>(
             memory_mapping,
-            updates_addr,
-            updates_count,
+            input_addr,
+            input_size,
             invoke_context.get_check_aligned(),
             invoke_context.get_check_size(),
         )?;
-        for update in updates.iter() {
-            let mut borrowed_account = instruction_context
-                .try_borrow_instruction_account(
-                    transaction_context,
-                    update.instruction_account_index,
-                )
-                .map_err(SyscallError::InstructionError)?;
-            let attribute =
-                unsafe { std::mem::transmute::<_, TransactionContextAttribute>(update.attribute) };
-            match attribute {
-                TransactionContextAttribute::TransactionAccountOwner => {
-                    let owner_pubkey = translate_type::<Pubkey>(
-                        memory_mapping,
-                        update.value,
-                        invoke_context.get_check_aligned(),
-                    )?;
 
-                    borrowed_account
-                        .set_owner(&owner_pubkey.to_bytes())
-                        .map_err(SyscallError::InstructionError)?;
-                }
-                TransactionContextAttribute::TransactionAccountLamports => borrowed_account
-                    .set_lamports(update.value)
-                    .map_err(SyscallError::InstructionError)?,
-                TransactionContextAttribute::TransactionAccountData => borrowed_account
-                    .set_data_length(update.value as usize)
-                    .map_err(SyscallError::InstructionError)?,
-                TransactionContextAttribute::TransactionAccountIsExecutable => borrowed_account
-                    .set_executable(update.value != 0)
-                    .map_err(SyscallError::InstructionError)?,
-                _ => {
-                    return Err(SyscallError::InvalidAttribute.into());
-                }
+        let call_result = translate_slice_mut::<u8>(
+            memory_mapping,
+            result_addr,
+            output as u64,
+            invoke_context.get_check_aligned(),
+            invoke_context.get_check_size(),
+        )?;
+
+        let calculation = match group_op {
+            ALT_BN128_ADD => alt_bn128_addition,
+            ALT_BN128_MUL => alt_bn128_multiplication,
+            ALT_BN128_PAIRING => alt_bn128_pairing,
+            _ => {
+                return Err(SyscallError::InvalidAttribute.into());
             }
+        };
+
+        let result_point = match calculation(input) {
+            Ok(result_point) => result_point,
+            Err(e) => {
+                return Ok(e.into());
+            }
+        };
+
+        if result_point.len() != output {
+            return Ok(AltBn128Error::SliceOutOfBounds.into());
         }
-        Ok(0)
+
+        call_result.copy_from_slice(&result_point);
+        Ok(SUCCESS)
     }
 );
 
@@ -1723,7 +1730,7 @@ mod tests {
             aligned_memory::AlignedMemory,
             ebpf::{self, HOST_ALIGN},
             memory_region::MemoryRegion,
-            vm::{Config, SyscallFunction},
+            vm::{BuiltInFunction, Config},
         },
         solana_sdk::{
             account::AccountSharedData,
@@ -1734,7 +1741,7 @@ mod tests {
             sysvar::{clock::Clock, epoch_schedule::EpochSchedule, rent::Rent},
             transaction_context::TransactionContext,
         },
-        std::{borrow::Cow, str::FromStr},
+        std::{borrow::Cow, cell::RefCell, rc::Rc, str::FromStr},
     };
 
     macro_rules! assert_access_violation {
@@ -2056,10 +2063,7 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(string.len() as u64 - 1);
+        invoke_context.mock_set_remaining(string.len() as u64 - 1);
         let mut result = ProgramResult::Ok(0);
         SyscallPanic::call(
             &mut invoke_context,
@@ -2078,10 +2082,7 @@ mod tests {
             ),
         ));
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(string.len() as u64);
+        invoke_context.mock_set_remaining(string.len() as u64);
         let mut result = ProgramResult::Ok(0);
         SyscallPanic::call(
             &mut invoke_context,
@@ -2120,10 +2121,7 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(400 - 1);
+        invoke_context.mock_set_remaining(400 - 1);
         let mut result = ProgramResult::Ok(0);
         SyscallLog::call(
             &mut invoke_context,
@@ -2199,10 +2197,7 @@ mod tests {
         );
         let cost = invoke_context.get_compute_budget().log_64_units;
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(cost);
+        invoke_context.mock_set_remaining(cost);
         let config = Config::default();
         let mut memory_mapping = MemoryMapping::new(vec![], &config).unwrap();
         let mut result = ProgramResult::Ok(0);
@@ -2266,10 +2261,7 @@ mod tests {
         );
         assert_access_violation!(result, 0x100000001, 32);
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(1);
+        invoke_context.mock_set_remaining(1);
         let mut result = ProgramResult::Ok(0);
         SyscallLogPubkey::call(
             &mut invoke_context,
@@ -2288,10 +2280,7 @@ mod tests {
             ),
         ));
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(cost);
+        invoke_context.mock_set_remaining(cost);
         let mut result = ProgramResult::Ok(0);
         SyscallLogPubkey::call(
             &mut invoke_context,
@@ -2609,19 +2598,16 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(
-                (invoke_context.get_compute_budget().sha256_base_cost
-                    + invoke_context.get_compute_budget().mem_op_base_cost.max(
-                        invoke_context
-                            .get_compute_budget()
-                            .sha256_byte_cost
-                            .saturating_mul((bytes1.len() + bytes2.len()) as u64 / 2),
-                    ))
-                    * 4,
-            );
+        invoke_context.mock_set_remaining(
+            (invoke_context.get_compute_budget().sha256_base_cost
+                + invoke_context.get_compute_budget().mem_op_base_cost.max(
+                    invoke_context
+                        .get_compute_budget()
+                        .sha256_byte_cost
+                        .saturating_mul((bytes1.len() + bytes2.len()) as u64 / 2),
+                ))
+                * 4,
+        );
 
         let mut result = ProgramResult::Ok(0);
         SyscallSha256::call(
@@ -2738,15 +2724,12 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(
-                (invoke_context
-                    .get_compute_budget()
-                    .curve25519_edwards_validate_point_cost)
-                    * 2,
-            );
+        invoke_context.mock_set_remaining(
+            (invoke_context
+                .get_compute_budget()
+                .curve25519_edwards_validate_point_cost)
+                * 2,
+        );
 
         let mut result = ProgramResult::Ok(0);
         SyscallCurvePointValidation::call(
@@ -2838,15 +2821,12 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(
-                (invoke_context
-                    .get_compute_budget()
-                    .curve25519_ristretto_validate_point_cost)
-                    * 2,
-            );
+        invoke_context.mock_set_remaining(
+            (invoke_context
+                .get_compute_budget()
+                .curve25519_ristretto_validate_point_cost)
+                * 2,
+        );
 
         let mut result = ProgramResult::Ok(0);
         SyscallCurvePointValidation::call(
@@ -2972,21 +2952,18 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(
-                (invoke_context
+        invoke_context.mock_set_remaining(
+            (invoke_context
+                .get_compute_budget()
+                .curve25519_edwards_add_cost
+                + invoke_context
                     .get_compute_budget()
-                    .curve25519_edwards_add_cost
-                    + invoke_context
-                        .get_compute_budget()
-                        .curve25519_edwards_subtract_cost
-                    + invoke_context
-                        .get_compute_budget()
-                        .curve25519_edwards_multiply_cost)
-                    * 2,
-            );
+                    .curve25519_edwards_subtract_cost
+                + invoke_context
+                    .get_compute_budget()
+                    .curve25519_edwards_multiply_cost)
+                * 2,
+        );
 
         let mut result = ProgramResult::Ok(0);
         SyscallCurveGroupOps::call(
@@ -3182,21 +3159,18 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(
-                (invoke_context
+        invoke_context.mock_set_remaining(
+            (invoke_context
+                .get_compute_budget()
+                .curve25519_ristretto_add_cost
+                + invoke_context
                     .get_compute_budget()
-                    .curve25519_ristretto_add_cost
-                    + invoke_context
-                        .get_compute_budget()
-                        .curve25519_ristretto_subtract_cost
-                    + invoke_context
-                        .get_compute_budget()
-                        .curve25519_ristretto_multiply_cost)
-                    * 2,
-            );
+                    .curve25519_ristretto_subtract_cost
+                + invoke_context
+                    .get_compute_budget()
+                    .curve25519_ristretto_multiply_cost)
+                * 2,
+        );
 
         let mut result = ProgramResult::Ok(0);
         SyscallCurveGroupOps::call(
@@ -3401,23 +3375,20 @@ mod tests {
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(
-                invoke_context
+        invoke_context.mock_set_remaining(
+            invoke_context
+                .get_compute_budget()
+                .curve25519_edwards_msm_base_cost
+                + invoke_context
                     .get_compute_budget()
-                    .curve25519_edwards_msm_base_cost
-                    + invoke_context
-                        .get_compute_budget()
-                        .curve25519_edwards_msm_incremental_cost
-                    + invoke_context
-                        .get_compute_budget()
-                        .curve25519_ristretto_msm_base_cost
-                    + invoke_context
-                        .get_compute_budget()
-                        .curve25519_ristretto_msm_incremental_cost,
-            );
+                    .curve25519_edwards_msm_incremental_cost
+                + invoke_context
+                    .get_compute_budget()
+                    .curve25519_ristretto_msm_base_cost
+                + invoke_context
+                    .get_compute_budget()
+                    .curve25519_ristretto_msm_incremental_cost,
+        );
 
         let mut result = ProgramResult::Ok(0);
         SyscallCurveMultiscalarMultiplication::call(
@@ -3683,7 +3654,7 @@ mod tests {
         seeds: &[&[u8]],
         program_id: &Pubkey,
         overlap_outputs: bool,
-        syscall: SyscallFunction<&'a mut InvokeContext<'b>>,
+        syscall: BuiltInFunction<InvokeContext<'b>>,
     ) -> Result<(Pubkey, u8), EbpfError> {
         const SEEDS_VA: u64 = 0x100000000;
         const PROGRAM_ID_VA: u64 = 0x200000000;
@@ -3937,7 +3908,7 @@ mod tests {
         let data = translate_slice_mut::<u8>(
             &memory_mapping,
             VM_BASE_ADDRESS.saturating_add(DATA_OFFSET as u64),
-            processed_sibling_instruction.data_len as u64,
+            processed_sibling_instruction.data_len,
             true,
             true,
         )
@@ -3945,16 +3916,13 @@ mod tests {
         let accounts = translate_slice_mut::<AccountMeta>(
             &memory_mapping,
             VM_BASE_ADDRESS.saturating_add(ACCOUNTS_OFFSET as u64),
-            processed_sibling_instruction.accounts_len as u64,
+            processed_sibling_instruction.accounts_len,
             true,
             true,
         )
         .unwrap();
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(syscall_base_cost);
+        invoke_context.mock_set_remaining(syscall_base_cost);
         let mut result = ProgramResult::Ok(0);
         SyscallGetProcessedSiblingInstruction::call(
             &mut invoke_context,
@@ -3986,10 +3954,7 @@ mod tests {
             );
         }
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(syscall_base_cost);
+        invoke_context.mock_set_remaining(syscall_base_cost);
         let mut result = ProgramResult::Ok(0);
         SyscallGetProcessedSiblingInstruction::call(
             &mut invoke_context,
@@ -4003,10 +3968,7 @@ mod tests {
         );
         assert_eq!(result.unwrap(), 0);
 
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(syscall_base_cost);
+        invoke_context.mock_set_remaining(syscall_base_cost);
         let mut result = ProgramResult::Ok(0);
         SyscallGetProcessedSiblingInstruction::call(
             &mut invoke_context,
@@ -4024,148 +3986,6 @@ mod tests {
                 SyscallError::CopyOverlapping
             ),
         ));
-    }
-
-    #[test]
-    fn test_syscall_sol_set_account_properties() {
-        let program_key = Pubkey::new_unique();
-        let loader_key = bpf_loader::id();
-        let transaction_accounts = vec![
-            (
-                loader_key,
-                AccountSharedData::new(0, 0, &native_loader::id()),
-            ),
-            (program_key, AccountSharedData::new(0, 0, &loader_key)),
-            (
-                Pubkey::new_unique(),
-                AccountSharedData::new(0, 0, &program_key),
-            ),
-            (
-                Pubkey::new_unique(),
-                AccountSharedData::new(0, 0, &program_key),
-            ),
-        ];
-        let mut transaction_context =
-            TransactionContext::new(transaction_accounts, Some(Rent::default()), 1, 1);
-        transaction_context
-            .get_next_instruction_context()
-            .unwrap()
-            .configure(
-                &[0, 1],
-                &[
-                    InstructionAccount {
-                        index_in_transaction: 2,
-                        index_in_caller: 2,
-                        index_in_callee: 0,
-                        is_signer: false,
-                        is_writable: true,
-                    },
-                    InstructionAccount {
-                        index_in_transaction: 3,
-                        index_in_caller: 3,
-                        index_in_callee: 0,
-                        is_signer: false,
-                        is_writable: true,
-                    },
-                ],
-                &[],
-            );
-        let mut invoke_context = InvokeContext::new_mock(&mut transaction_context, &[]);
-        invoke_context.push().unwrap();
-
-        let keys = [loader_key];
-        let updates_list = [
-            AccountPropertyUpdate {
-                instruction_account_index: 0,
-                attribute: TransactionContextAttribute::TransactionAccountLamports as u16,
-                value: 10000000,
-                _marker: std::marker::PhantomData::default(),
-            },
-            AccountPropertyUpdate {
-                instruction_account_index: 0,
-                attribute: TransactionContextAttribute::TransactionAccountData as u16,
-                value: 512,
-                _marker: std::marker::PhantomData::default(),
-            },
-            AccountPropertyUpdate {
-                instruction_account_index: 0,
-                attribute: TransactionContextAttribute::TransactionAccountIsExecutable as u16,
-                value: true as u64,
-                _marker: std::marker::PhantomData::default(),
-            },
-            AccountPropertyUpdate {
-                instruction_account_index: 1,
-                attribute: TransactionContextAttribute::TransactionAccountOwner as u16,
-                value: VM_ADDRESS_KEYS as u64,
-                _marker: std::marker::PhantomData::default(),
-            },
-        ];
-
-        let cost = invoke_context
-            .get_compute_budget()
-            .syscall_base_cost
-            .saturating_add(
-                invoke_context
-                    .get_compute_budget()
-                    .account_property_update_cost
-                    .saturating_mul(updates_list.len() as u64),
-            );
-
-        const VM_ADDRESS_KEYS: u64 = 0x100000000;
-        const VM_ADDRESS_UPDATES_LIST: u64 = 0x200000000;
-        let config = Config::default();
-        let mut memory_mapping = MemoryMapping::new(
-            vec![
-                MemoryRegion {
-                    host_addr: keys.as_ptr() as u64,
-                    vm_addr: VM_ADDRESS_KEYS,
-                    len: (keys.len() * std::mem::size_of::<Pubkey>()) as u64,
-                    vm_gap_shift: 63,
-                    is_writable: true,
-                },
-                MemoryRegion {
-                    host_addr: updates_list.as_ptr() as u64,
-                    vm_addr: VM_ADDRESS_UPDATES_LIST,
-                    len: (updates_list.len() * std::mem::size_of::<AccountPropertyUpdate>()) as u64,
-                    vm_gap_shift: 63,
-                    is_writable: true,
-                },
-            ],
-            &config,
-        )
-        .unwrap();
-
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(cost);
-        let mut result = ProgramResult::Ok(0);
-        SyscallSetAccountProperties::call(
-            &mut invoke_context,
-            VM_ADDRESS_UPDATES_LIST,
-            updates_list.len() as u64,
-            0,
-            0,
-            0,
-            &mut memory_mapping,
-            &mut result,
-        );
-        assert_eq!(result.unwrap(), 0);
-        {
-            let transaction_context = &invoke_context.transaction_context;
-            let account = transaction_context
-                .get_account_at_index(2)
-                .unwrap()
-                .borrow();
-            assert_eq!(account.lamports(), 10000000);
-            assert_eq!(account.data().len(), 512);
-            assert!(account.executable());
-            let account = transaction_context
-                .get_account_at_index(3)
-                .unwrap()
-                .borrow();
-            assert_eq!(account.owner(), &loader_key);
-        }
     }
 
     #[test]
@@ -4275,10 +4095,7 @@ mod tests {
                 .unwrap(),
             create_program_address(&mut invoke_context, &[b"Talking"], &address).unwrap(),
         );
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(0);
+        invoke_context.mock_set_remaining(0);
         assert!(matches!(
             create_program_address(&mut invoke_context, &[b"", &[1]], &address),
             Err(EbpfError::UserError(error)) if error.downcast_ref::<BpfError>().unwrap() == &BpfError::SyscallError(
@@ -4303,10 +4120,7 @@ mod tests {
 
         for _ in 0..1_000 {
             let address = Pubkey::new_unique();
-            invoke_context
-                .get_compute_meter()
-                .borrow_mut()
-                .mock_set_remaining(cost * max_tries);
+            invoke_context.mock_set_remaining(cost * max_tries);
             let (found_address, bump_seed) =
                 try_find_program_address(&mut invoke_context, &[b"Lil'", b"Bits"], &address)
                     .unwrap();
@@ -4322,21 +4136,12 @@ mod tests {
         }
 
         let seeds: &[&[u8]] = &[b""];
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(cost * max_tries);
+        invoke_context.mock_set_remaining(cost * max_tries);
         let (_, bump_seed) =
             try_find_program_address(&mut invoke_context, seeds, &address).unwrap();
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(cost * (max_tries - bump_seed as u64));
+        invoke_context.mock_set_remaining(cost * (max_tries - bump_seed as u64));
         try_find_program_address(&mut invoke_context, seeds, &address).unwrap();
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(cost * (max_tries - bump_seed as u64 - 1));
+        invoke_context.mock_set_remaining(cost * (max_tries - bump_seed as u64 - 1));
         assert!(matches!(
             try_find_program_address(&mut invoke_context, seeds, &address),
             Err(EbpfError::UserError(error)) if error.downcast_ref::<BpfError>().unwrap() == &BpfError::SyscallError(
@@ -4345,10 +4150,7 @@ mod tests {
         ));
 
         let exceeded_seed = &[127; MAX_SEED_LEN + 1];
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(cost * (max_tries - 1));
+        invoke_context.mock_set_remaining(cost * (max_tries - 1));
         assert!(matches!(
             try_find_program_address(&mut invoke_context, &[exceeded_seed], &address),
             Err(EbpfError::UserError(error)) if error.downcast_ref::<BpfError>().unwrap() == &BpfError::SyscallError(
@@ -4374,10 +4176,7 @@ mod tests {
             &[16],
             &[17],
         ];
-        invoke_context
-            .get_compute_meter()
-            .borrow_mut()
-            .mock_set_remaining(cost * (max_tries - 1));
+        invoke_context.mock_set_remaining(cost * (max_tries - 1));
         assert!(matches!(
             try_find_program_address(&mut invoke_context, exceeded_seeds, &address),
             Err(EbpfError::UserError(error)) if error.downcast_ref::<BpfError>().unwrap() == &BpfError::SyscallError(
